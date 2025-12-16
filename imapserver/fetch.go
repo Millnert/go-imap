@@ -86,26 +86,24 @@ func (c *Conn) handleFetch(dec *imapwire.Decoder, numKind NumKind) error {
 				return dec.Err()
 			}
 			options.ModSeq = true
+
+			// RFC 7162: VANISHED modifier MUST be inside CHANGEDSINCE parentheses
+			// Format: (CHANGEDSINCE 123 VANISHED)
+			if dec.SP() {
+				var vanished string
+				if dec.Atom(&vanished) && strings.ToUpper(vanished) == "VANISHED" {
+					if numKind != NumKindUID {
+						return fmt.Errorf("VANISHED modifier only allowed with UID FETCH")
+					}
+					options.Vanished = true
+				}
+			}
 		} else {
 			return fmt.Errorf("unknown FETCH modifier: %v", param)
 		}
 
 		if !dec.ExpectSpecial(')') {
 			return dec.Err()
-		}
-	}
-
-	// Check for VANISHED modifier (separate from parenthesized modifiers)
-	if dec.SP() {
-		var atom string
-		if dec.ExpectAtom(&atom) && strings.ToUpper(atom) == "VANISHED" {
-			if numKind != NumKindUID {
-				return fmt.Errorf("VANISHED modifier only allowed with UID FETCH")
-			}
-			options.Vanished = true
-		} else {
-			// Put the atom back by returning an error that we don't recognize it
-			return fmt.Errorf("unexpected token: %v", atom)
 		}
 	}
 
