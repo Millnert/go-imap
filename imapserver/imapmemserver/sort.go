@@ -1,224 +1,267 @@
 package imapmemserver
 
 import (
-	"bufio"
 	"bytes"
-	"net/mail"
-	"net/textproto"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/emersion/go-imap/v2"
 	"github.com/emersion/go-imap/v2/imapserver"
+	gomessage "github.com/emersion/go-message"
+	"github.com/emersion/go-message/mail"
 )
 
-// Sort performs a SORT command.
-func (mbox *MailboxView) Sort(numKind imapserver.NumKind, criteria *imap.SearchCriteria, sortCriteria []imap.SortCriterion) ([]uint32, error) {
+func (sess *UserSession) Sort(kind imapserver.NumKind, sortCriteria []imap.SortCriterion, charset string, searchCriteria *imap.SearchCriteria, options *imap.SortOptions) (*imap.SortData, error) {
+	return sess.mailbox.Sort(kind, sortCriteria, charset, searchCriteria, options)
+}
+
+func (mbox *MailboxView) Sort(kind imapserver.NumKind, sortCriteria []imap.SortCriterion, charset string, searchCriteria *imap.SearchCriteria, options *imap.SortOptions) (*imap.SortData, error) {
 	mbox.mutex.Lock()
 	defer mbox.mutex.Unlock()
 
-	// Apply search criteria
-	mbox.staticSearchCriteria(criteria)
+	mbox.staticSearchCriteria(searchCriteria)
 
-	// First find all messages that match the search criteria
-	var matchedMessages []*message
-	var matchedSeqNums []uint32
-	var matchedIndices []int
+	// 1. Search for messages
+	var matchingMsgs []*message
 	for i, msg := range mbox.l {
 		seqNum := mbox.tracker.EncodeSeqNum(uint32(i) + 1)
-
-		if !msg.search(seqNum, criteria) {
-			continue
+		if msg.search(seqNum, searchCriteria) {
+			matchingMsgs = append(matchingMsgs, msg)
 		}
-
-		matchedMessages = append(matchedMessages, msg)
-		matchedSeqNums = append(matchedSeqNums, seqNum)
-		matchedIndices = append(matchedIndices, i)
 	}
 
-	// Sort the matched messages based on the sort criteria
-	sortMatchedMessages(matchedMessages, matchedSeqNums, matchedIndices, sortCriteria)
+	// 2. Sort the messages
+	sorter := &memSort{
+		criteria: sortCriteria,
+		msgs:     matchingMsgs,
+		mbox:     mbox,
+	}
+	sort.Sort(sorter)
 
-	// Create sorted response
-	var data []uint32
-	for i, msg := range matchedMessages {
-		var num uint32
-		switch numKind {
-		case imapserver.NumKindSeq:
-			if matchedSeqNums[i] == 0 {
-				continue
-			}
-			num = matchedSeqNums[i]
-		case imapserver.NumKindUID:
-			num = uint32(msg.uid)
+	// 3. Collect the results
+	var uidToSeq map[imap.UID]uint32
+	if kind != imapserver.NumKindUID {
+		uidToSeq = make(map[imap.UID]uint32, len(mbox.l))
+		for i, m := range mbox.l {
+			// Create a map from UID to current sequence number
+			uidToSeq[m.uid] = mbox.tracker.EncodeSeqNum(uint32(i) + 1)
 		}
-		data = append(data, num)
 	}
 
-	return data, nil
-}
-
-// sortMatchedMessages sorts messages according to the specified sort criteria
-func sortMatchedMessages(messages []*message, seqNums []uint32, indices []int, criteria []imap.SortCriterion) {
-	if len(messages) < 2 {
-		return // Nothing to sort
-	}
-
-	// Create a slice of indices for sorting
-	indices2 := make([]int, len(messages))
-	for i := range indices2 {
-		indices2[i] = i
-	}
-
-	// Sort the indices based on the criteria
-	sort.SliceStable(indices2, func(i, j int) bool {
-		i2, j2 := indices2[i], indices2[j]
-
-		// Apply each criterion in order until we find a difference
-		for _, criterion := range criteria {
-			result := compareByCriterion(messages[i2], messages[j2], criterion.Key)
-
-			// Apply reverse if needed
-			if criterion.Reverse {
-				result = -result
-			}
-
-			// If comparison yields a difference, return the result
-			if result < 0 {
-				return true
-			} else if result > 0 {
-				return false
-			}
-			// If equal, continue to the next criterion
-		}
-
-		// If all criteria are equal, maintain original order
-		return i < j
-	})
-
-	// Reorder the original slices according to the sorted indices
-	newMessages := make([]*message, len(messages))
-	newSeqNums := make([]uint32, len(seqNums))
-	newIndices := make([]int, len(indices))
-
-	for i, idx := range indices2 {
-		newMessages[i] = messages[idx]
-		newSeqNums[i] = seqNums[idx]
-		newIndices[i] = indices[idx]
-	}
-
-	// Copy sorted slices back to original slices
-	copy(messages, newMessages)
-	copy(seqNums, newSeqNums)
-	copy(indices, newIndices)
-}
-
-// compareByCriterion compares two messages based on a single criterion
-// returns -1 if a < b, 0 if a == b, 1 if a > b
-func compareByCriterion(a, b *message, key imap.SortKey) int {
-	switch key {
-	case imap.SortKeyArrival:
-		// For ARRIVAL, we use the UID as the arrival order
-		if a.uid < b.uid {
-			return -1
-		} else if a.uid > b.uid {
-			return 1
-		}
-		return 0
-
-	case imap.SortKeyDate:
-		// Compare internal date
-		if a.t.Before(b.t) {
-			return -1
-		} else if a.t.After(b.t) {
-			return 1
-		}
-		return 0
-
-	case imap.SortKeySize:
-		// Compare message sizes
-		aSize := len(a.buf)
-		bSize := len(b.buf)
-		if aSize < bSize {
-			return -1
-		} else if aSize > bSize {
-			return 1
-		}
-		return 0
-
-	case imap.SortKeyFrom:
-		// NOTE: A fully compliant implementation as per RFC 5256 would parse
-		// the address and sort by mailbox, then host. This is a simplified
-		// case-insensitive comparison of the full header value.
-		fromA := getHeader(a.buf, "From")
-		fromB := getHeader(b.buf, "From")
-		return strings.Compare(strings.ToLower(fromA), strings.ToLower(fromB))
-
-	case imap.SortKeyTo:
-		// NOTE: Simplified comparison. See SortKeyFrom.
-		toA := getHeader(a.buf, "To")
-		toB := getHeader(b.buf, "To")
-		return strings.Compare(strings.ToLower(toA), strings.ToLower(toB))
-
-	case imap.SortKeyCc:
-		// NOTE: Simplified comparison. See SortKeyFrom.
-		ccA := getHeader(a.buf, "Cc")
-		ccB := getHeader(b.buf, "Cc")
-		return strings.Compare(strings.ToLower(ccA), strings.ToLower(ccB))
-
-	case imap.SortKeySubject:
-		// RFC 5256 specifies i;ascii-casemap collation, which is case-insensitive.
-		subjA := getHeader(a.buf, "Subject")
-		subjB := getHeader(b.buf, "Subject")
-		return strings.Compare(strings.ToLower(subjA), strings.ToLower(subjB))
-
-	case imap.SortKeyDisplay:
-		// RFC 5957: sort by display-name, fallback to mailbox.
-		fromA := getHeader(a.buf, "From")
-		fromB := getHeader(b.buf, "From")
-
-		addrA, errA := mail.ParseAddress(fromA)
-		addrB, errB := mail.ParseAddress(fromB)
-
-		var displayA, displayB string
-
-		if errA == nil {
-			if addrA.Name != "" {
-				displayA = addrA.Name
-			} else {
-				displayA = addrA.Address
-			}
+	var data imap.SortData
+	for _, msg := range sorter.msgs {
+		if kind == imapserver.NumKindUID {
+			data.All = append(data.All, uint32(msg.uid))
 		} else {
-			displayA = fromA // Fallback to raw header on parse error
-		}
-
-		if errB == nil {
-			if addrB.Name != "" {
-				displayB = addrB.Name
-			} else {
-				displayB = addrB.Address
+			if seqNum, ok := uidToSeq[msg.uid]; ok && seqNum > 0 {
+				data.All = append(data.All, seqNum)
 			}
-		} else {
-			displayB = fromB // Fallback to raw header on parse error
 		}
-
-		// A full implementation would use locale-aware sorting (e.g., golang.org/x/text/collate).
-		// A case-insensitive comparison is a reasonable and significant improvement.
-		return strings.Compare(strings.ToLower(displayA), strings.ToLower(displayB))
-
-	default:
-		// Default to no sorting for unknown criteria
-		return 0
 	}
+
+	// 4. Calculate MIN, MAX, COUNT for ESORT
+	data.Count = uint32(len(data.All))
+	if len(data.All) > 0 {
+		// Find the true min and max, regardless of sort order, as required
+		// by RFC 5267.
+		min, max := data.All[0], data.All[0]
+		for _, num := range data.All[1:] {
+			if num < min {
+				min = num
+			}
+			if num > max {
+				max = num
+			}
+		}
+		data.Min = min
+		data.Max = max
+	}
+
+	return &data, nil
 }
 
-// getHeader extracts a header value from a message's raw bytes.
-// It performs a case-insensitive search for the key.
-func getHeader(buf []byte, key string) string {
-	r := textproto.NewReader(bufio.NewReader(bytes.NewReader(buf)))
-	hdr, err := r.ReadMIMEHeader()
+type memSort struct {
+	criteria []imap.SortCriterion
+	msgs     []*message
+	mbox     *MailboxView
+}
+
+func (ms *memSort) Len() int {
+	return len(ms.msgs)
+}
+
+func (ms *memSort) Swap(i, j int) {
+	ms.msgs[i], ms.msgs[j] = ms.msgs[j], ms.msgs[i]
+}
+
+func (ms *memSort) Less(i, j int) bool {
+	msgI, msgJ := ms.msgs[i], ms.msgs[j]
+
+	// Parse headers on-demand for sorting
+	var headerI, headerJ gomessage.Header
+	var headerIParsed, headerJParsed bool
+	var dateI, dateJ time.Time
+	var sizeI, sizeJ int
+
+	for _, c := range ms.criteria {
+		var cmp int
+		switch c.Key {
+		case imap.SortKeyArrival:
+			cmp = msgI.t.Compare(msgJ.t)
+		case imap.SortKeyCc:
+			if !headerIParsed {
+				headerI, _ = ms.parseHeader(msgI)
+				headerIParsed = true
+			}
+			if !headerJParsed {
+				headerJ, _ = ms.parseHeader(msgJ)
+				headerJParsed = true
+			}
+			cmp = strings.Compare(headerI.Get("Cc"), headerJ.Get("Cc"))
+		case imap.SortKeyDate:
+			if dateI.IsZero() {
+				dateI = ms.parseDate(msgI)
+			}
+			if dateJ.IsZero() {
+				dateJ = ms.parseDate(msgJ)
+			}
+			cmp = dateI.Compare(dateJ)
+		case imap.SortKeyDisplayFrom:
+			if !headerIParsed {
+				headerI, _ = ms.parseHeader(msgI)
+				headerIParsed = true
+			}
+			if !headerJParsed {
+				headerJ, _ = ms.parseHeader(msgJ)
+				headerJParsed = true
+			}
+			hI := mail.Header{Header: headerI}
+			hJ := mail.Header{Header: headerJ}
+			var valI, valJ string
+			if addrs, err := hI.AddressList("From"); err == nil && len(addrs) > 0 {
+				if addrs[0].Name != "" {
+					valI = addrs[0].Name
+				} else {
+					valI = addrs[0].Address
+				}
+			}
+			if addrs, err := hJ.AddressList("From"); err == nil && len(addrs) > 0 {
+				if addrs[0].Name != "" {
+					valJ = addrs[0].Name
+				} else {
+					valJ = addrs[0].Address
+				}
+			}
+			cmp = strings.Compare(valI, valJ)
+		case imap.SortKeyDisplayTo:
+			if !headerIParsed {
+				headerI, _ = ms.parseHeader(msgI)
+				headerIParsed = true
+			}
+			if !headerJParsed {
+				headerJ, _ = ms.parseHeader(msgJ)
+				headerJParsed = true
+			}
+			hI := mail.Header{Header: headerI}
+			hJ := mail.Header{Header: headerJ}
+			var valI, valJ string
+			if addrs, err := hI.AddressList("To"); err == nil && len(addrs) > 0 {
+				if addrs[0].Name != "" {
+					valI = addrs[0].Name
+				} else {
+					valI = addrs[0].Address
+				}
+			}
+			if addrs, err := hJ.AddressList("To"); err == nil && len(addrs) > 0 {
+				if addrs[0].Name != "" {
+					valJ = addrs[0].Name
+				} else {
+					valJ = addrs[0].Address
+				}
+			}
+			cmp = strings.Compare(valI, valJ)
+		case imap.SortKeyFrom:
+			if !headerIParsed {
+				headerI, _ = ms.parseHeader(msgI)
+				headerIParsed = true
+			}
+			if !headerJParsed {
+				headerJ, _ = ms.parseHeader(msgJ)
+				headerJParsed = true
+			}
+			hI := mail.Header{Header: headerI}
+			hJ := mail.Header{Header: headerJ}
+			var valI, valJ string
+			if addrs, err := hI.AddressList("From"); err == nil && len(addrs) > 0 {
+				valI = addrs[0].Address
+			}
+			if addrs, err := hJ.AddressList("From"); err == nil && len(addrs) > 0 {
+				valJ = addrs[0].Address
+			}
+			cmp = strings.Compare(valI, valJ)
+		case imap.SortKeySize:
+			if sizeI == 0 {
+				sizeI = len(msgI.buf)
+			}
+			if sizeJ == 0 {
+				sizeJ = len(msgJ.buf)
+			}
+			if sizeI < sizeJ {
+				cmp = -1
+			} else if sizeI > sizeJ {
+				cmp = 1
+			}
+		case imap.SortKeySubject:
+			if !headerIParsed {
+				headerI, _ = ms.parseHeader(msgI)
+				headerIParsed = true
+			}
+			if !headerJParsed {
+				headerJ, _ = ms.parseHeader(msgJ)
+				headerJParsed = true
+			}
+			hI := mail.Header{Header: headerI}
+			hJ := mail.Header{Header: headerJ}
+			subjI, _ := hI.Subject()
+			subjJ, _ := hJ.Subject()
+			cmp = strings.Compare(subjI, subjJ)
+		case imap.SortKeyTo:
+			if !headerIParsed {
+				headerI, _ = ms.parseHeader(msgI)
+				headerIParsed = true
+			}
+			if !headerJParsed {
+				headerJ, _ = ms.parseHeader(msgJ)
+				headerJParsed = true
+			}
+			cmp = strings.Compare(headerI.Get("To"), headerJ.Get("To"))
+		}
+		if cmp != 0 {
+			if c.Reverse {
+				return cmp > 0
+			}
+			return cmp < 0
+		}
+	}
+
+	return msgI.uid < msgJ.uid // Tie-breaker
+}
+
+func (ms *memSort) parseHeader(msg *message) (gomessage.Header, error) {
+	mr, err := mail.CreateReader(bytes.NewReader(msg.buf))
 	if err != nil {
-		return "" // Or log the error
+		return gomessage.Header{}, err
 	}
-	return hdr.Get(key)
+	return mr.Header.Header, nil
+}
+
+func (ms *memSort) parseDate(msg *message) time.Time {
+	header, err := ms.parseHeader(msg)
+	if err != nil {
+		return time.Time{}
+	}
+	h := mail.Header{Header: header}
+	date, _ := h.Date()
+	return date
 }
