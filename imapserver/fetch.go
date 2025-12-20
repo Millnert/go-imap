@@ -142,6 +142,10 @@ func handleFetchAtt(dec *imapwire.Decoder, attName string, options *imap.FetchOp
 		options.UID = true
 	case "MODSEQ":
 		options.ModSeq = true
+	case "EMAILID":
+		options.EmailID = true
+	case "THREADID":
+		options.ThreadID = true
 	case "RFC822": // equivalent to BODY[]
 		bs := &imap.FetchItemBodySection{}
 		writerOptions.obsolete[bs] = attName
@@ -533,6 +537,25 @@ func (w *FetchResponseWriter) writeBodyStructure(bs imap.BodyStructure, extended
 	enc := w.enc.Encoder
 	enc.Atom(item).SP()
 	writeBodyStructure(enc, bs, extended)
+}
+
+// WriteEmailID writes the message's EMAILID (RFC 8474 OBJECTID).
+// The id should be a unique identifier for this specific message instance.
+func (w *FetchResponseWriter) WriteEmailID(id string) {
+	w.writeItemSep()
+	w.enc.Atom("EMAILID").SP().Special('(').Atom(id).Special(')')
+}
+
+// WriteThreadID writes the message's THREADID (RFC 8474 OBJECTID).
+// The id should be a unique identifier for the conversation thread.
+// Pass empty string if no thread ID is available.
+func (w *FetchResponseWriter) WriteThreadID(id string) {
+	w.writeItemSep()
+	if id == "" {
+		w.enc.Atom("THREADID").SP().NIL()
+	} else {
+		w.enc.Atom("THREADID").SP().Special('(').Atom(id).Special(')')
+	}
 }
 
 // Close closes the FETCH message writer.

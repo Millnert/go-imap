@@ -19,6 +19,8 @@ type FetchOptions struct {
 	BinarySection     []*FetchItemBinarySection     // requires IMAP4rev2 or BINARY
 	BinarySectionSize []*FetchItemBinarySectionSize // requires IMAP4rev2 or BINARY
 	ModSeq            bool                          // requires CONDSTORE
+	EmailID           bool                          // requires OBJECTID (RFC 8474)
+	ThreadID          bool                          // requires OBJECTID (RFC 8474)
 
 	ChangedSince uint64 // requires CONDSTORE
 	Vanished     bool   // requires QRESYNC, only valid for UID FETCH
