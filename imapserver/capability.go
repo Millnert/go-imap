@@ -105,6 +105,12 @@ func (c *Conn) availableCaps() []imap.Cap {
 			caps = append(caps, imap.Cap("ACL"))
 		}
 
+		// Add THREAD capabilities if the session supports it
+		if _, ok := c.session.(SessionThread); ok {
+			caps = append(caps, imap.Cap("THREAD=ORDEREDSUBJECT"))
+			caps = append(caps, imap.Cap("THREAD=REFERENCES"))
+		}
+
 		if appendLimitSession, ok := c.session.(SessionAppendLimit); ok {
 			limit := appendLimitSession.AppendLimit()
 			caps = append(caps, imap.Cap(fmt.Sprintf("APPENDLIMIT=%d", limit)))
